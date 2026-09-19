@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     max_active_leases   INTEGER,                          -- 会话级并发租约上限；NULL 表示不限
     base_retry_seconds  INTEGER NOT NULL DEFAULT 5,       -- 失败退避基数（第 1 次失败冷却秒数）
     max_retry_seconds   INTEGER NOT NULL DEFAULT 300,     -- 失败退避冷却上限（秒）
+    revision            INTEGER NOT NULL DEFAULT 0,       -- 状态版本号：每次成功 reopen 回退 +1
     created_at          TEXT NOT NULL,
     finalized_at        TEXT
 );
@@ -79,6 +80,11 @@ MIGRATIONS = [
     (
         "chunks.backoff_until",
         "ALTER TABLE chunks ADD COLUMN backoff_until TEXT",
+    ),
+    # 0004: 会话状态版本号；每次成功 reopen 完成结果纠错时 +1，旧库从 0 开始
+    (
+        "sessions.revision",
+        "ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
     ),
 ]
 

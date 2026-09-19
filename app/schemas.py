@@ -176,6 +176,31 @@ class FailResponse(BaseModel):
     retry_after: datetime = Field(description="冷却结束时间；在此之前该分片不可被领取")
 
 
+class ReopenRequest(BaseModel):
+    lease_token: str = Field(
+        min_length=1, max_length=128,
+        description="目标分片完成上报时使用并保留下来的租约令牌，须与服务端留存值一致")
+    expected_digest: str = Field(
+        min_length=1, max_length=256,
+        description="目标分片完成时留存的分片摘要，须与服务端留存值一致")
+
+
+class ReopenedChunk(BaseModel):
+    chunk_index: int
+    level: int = Field(
+        description="受影响分片相对目标分片的拓扑层级：目标为 0，其传递下游按"
+                    "“最长前置路径 +1”递增")
+    status: str = Field(description="回退后的分片状态，恒为 pending")
+
+
+class ReopenResponse(BaseModel):
+    session_id: str
+    revision: int = Field(
+        description="成功回退后的会话状态版本号；仅 reopen 成功时递增一次")
+    affected_chunks: list[ReopenedChunk] = Field(
+        description="目标分片及其全部传递下游，按（拓扑层级, 分片序号）稳定排列")
+
+
 class ManifestEntry(BaseModel):
     chunk_index: int
     chunk_digest: str
@@ -232,6 +257,9 @@ class ReadyResponse(BaseModel):
 class SessionStatusResponse(BaseModel):
     id: str
     status: str
+    revision: int = Field(
+        default=0,
+        description="会话状态版本号：每次成功的 reopen 完成结果纠错递增一次，其它操作不变")
     total_chunks: int
     completed_chunks: int
     missing_chunks: list[int]

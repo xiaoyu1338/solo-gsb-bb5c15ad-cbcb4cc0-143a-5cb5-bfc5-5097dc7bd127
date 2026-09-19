@@ -9,7 +9,10 @@
 - 上报失败：需携带当前有效租约令牌，成功后原子清除租约并递增失败次数，
   第 n 次失败冷却 min(max, base×2^(n-1)) 秒，冷却期间单片/批量领取均跳过该分片
 - 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
-- 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间）
+- 完成纠错（reopen）：凭目标分片完成时保留的 lease_token 与 expected_digest，在未提交会话中
+  将目标分片及其沿依赖图的全部传递下游在同一事务内重置为 pending（清摘要/完成时间/租约/退避，
+  保留累计失败次数），成功后会话 revision 递增一次
+- 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间、状态版本号 revision）
 - 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
 """
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import os
 import secrets
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -42,6 +46,9 @@ from .schemas import (
     LeaseResponse,
     ManifestEntry,
     ReadyResponse,
+    ReopenRequest,
+    ReopenResponse,
+    ReopenedChunk,
     SessionResponse,
     SessionStatusResponse,
 )
@@ -203,6 +210,71 @@ def conflict(message: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": message, **extra})
 
 
+def downstream_affected(
+    session_id: str, target: int
+) -> list[tuple[int, int]]:
+    """临界区内调用：求目标分片及其全部传递下游，并给出拓扑层级。
+
+    依赖边含义为 chunk -> 其前置；下游即“直接/间接依赖目标”的分片，取反向邻接 BFS
+    可达闭包。层级以目标为 0，在受影响子图内按“最长前置路径 +1”计算（受影响子图上
+    的 Kahn 拓扑序松弛），保证无环会话图下确定且唯一。返回按 (level, chunk_index)
+    升序排列的 (chunk_index, level) 列表，目标恒在首位。
+    """
+    deps = load_dependencies(session_id)
+    # 反向邻接：前置 -> 直接依赖它的下游分片（依赖列表已按升序存储）
+    children: dict[int, list[int]] = {}
+    for child, prereqs in deps.items():
+        for prereq in prereqs:
+            children.setdefault(prereq, []).append(child)
+
+    # 从目标出发的传递闭包（去重）
+    affected: set[int] = {target}
+    queue = deque([target])
+    while queue:
+        node = queue.popleft()
+        for child in children.get(node, []):
+            if child not in affected:
+                affected.add(child)
+                queue.append(child)
+
+    # 受影响子图内的入度（仅统计两端都在闭包内的边）
+    indegree: dict[int, int] = {node: 0 for node in affected}
+    for node in affected:
+        for prereq in deps.get(node, []):
+            if prereq in affected:
+                indegree[node] += 1
+
+    # Kahn 拓扑序上的最长路径层级：level(child) = max(level(前置)) + 1
+    levels = {target: 0}
+    ready = deque(sorted(node for node, deg in indegree.items() if deg == 0))
+    while ready:
+        node = ready.popleft()
+        node_level = levels.setdefault(node, 0)
+        for child in children.get(node, []):
+            if child not in affected:
+                continue
+            levels[child] = max(levels.get(child, 0), node_level + 1)
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+
+    return sorted((node, levels[node]) for node in affected)
+
+
+def reset_chunks(conn, session_id: str, indexes: list[int]) -> None:
+    """在当前事务内把分片批量重置为 pending：清摘要、完成时间、有效租约与退避截止，
+    failure_count 原样保留。参数按分片序号分批绑定，避免 IN 列表参数过多。"""
+    for start in range(0, len(indexes), 500):
+        batch = indexes[start:start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        conn.execute(
+            f"UPDATE chunks SET status = 'pending', lease_token = NULL,"
+            f" lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
+            f" backoff_until = NULL WHERE session_id = ? AND chunk_index IN ({placeholders})",
+            (session_id, *batch),
+        )
+
+
 # ---------------------------------------------------------------- 会话
 
 @app.post(
@@ -220,8 +292,8 @@ def create_session(req: CreateSessionRequest):
         conn = get_conn()
         conn.execute(
             "INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status,"
-            " max_active_leases, base_retry_seconds, max_retry_seconds, created_at)"
-            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            " max_active_leases, base_retry_seconds, max_retry_seconds, revision, created_at)"
+            " VALUES (?, ?, ?, ?, 'active', ?, ?, ?, 0, ?)",
             (session_id, req.total_chunks, req.file_digest, req.digest_algorithm,
              req.max_active_leases, req.base_retry_seconds, req.max_retry_seconds,
              now.isoformat()),
@@ -293,6 +365,7 @@ def get_session_status(session_id: str):
     return SessionStatusResponse(
         id=session["id"],
         status=session["status"],
+        revision=session["revision"] if session["revision"] is not None else 0,
         total_chunks=session["total_chunks"],
         completed_chunks=session["total_chunks"] - len(missing),
         missing_chunks=missing,
@@ -648,6 +721,67 @@ def finalize_session(session_id: str):
             for r in rows
         ],
         finalized_at=finalized_at,
+    )
+
+
+# ---------------------------------------------------------------- 完成结果纠错
+
+@app.post(
+    "/sessions/{session_id}/chunks/{chunk_index}/reopen",
+    response_model=ReopenResponse,
+    tags=["chunks"],
+    summary="完成结果纠错（reopen）：凭完成时保留的租约令牌与摘要回退目标分片及全部传递下游",
+    responses={
+        409: {
+            "description": "会话已提交、目标分片未完成，或租约令牌/摘要凭据不匹配"
+        },
+    },
+)
+def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
+    """把目标分片连同沿依赖图的全部传递下游在同一事务内重置为 pending：
+    清除摘要、完成时间、有效租约与退避截止时间，保留累计失败次数；会话 revision +1。
+
+    仅允许未提交会话中“已完成且 lease_token 与 expected_digest 均匹配”的目标分片发起。
+    任一校验失败立即抛出，不执行任何写入；全部写入与版本递增在同一次提交内完成，
+    临界区保证并发领取看不到回退中间状态。
+    """
+    with DB_LOCK:
+        conn = get_conn()
+        session = get_session_or_404(session_id)
+        chunk = get_chunk_or_404(session_id, chunk_index)
+
+        # 先做全部校验，任一失败不产生任何写入（无部分回退）
+        if session["status"] == "finalized":
+            raise HTTPException(status_code=409, detail="session already finalized")
+        if chunk["status"] != "completed":
+            raise HTTPException(status_code=409, detail="chunk not completed")
+        if chunk["lease_token"] != req.lease_token or chunk["chunk_digest"] != req.expected_digest:
+            raise HTTPException(
+                status_code=409,
+                detail="lease token or expected digest mismatch",
+            )
+
+        affected = downstream_affected(session_id, chunk_index)
+        indexes = [idx for idx, _ in affected]
+        try:
+            reset_chunks(conn, session_id, indexes)
+            conn.execute(
+                "UPDATE sessions SET revision = revision + 1 WHERE id = ?",
+                (session_id,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        new_revision = session["revision"] + 1
+
+    return ReopenResponse(
+        session_id=session_id,
+        revision=new_revision,
+        affected_chunks=[
+            ReopenedChunk(chunk_index=idx, level=level, status="pending")
+            for idx, level in affected
+        ],
     )
 
 
