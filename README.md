@@ -44,6 +44,7 @@ docker compose up --build
 - **租约**：同一分片同一时刻仅允许一个有效租约；租约过期后可被重新领取（令牌轮换）。前置分片未全部完成时领取返回 `409` 及按序缺失的 `missing_dependencies`；前置全部完成后无需额外操作即可领取。
 - **失败上报与退避重试（可选自动生效）**：`POST /sessions/{id}/chunks/{index}/fail` 必须携带该分片**当前有效租约的令牌**；校验通过后在同一事务内**原子清除租约、`failure_count` 加 1**，并将分片置于退避冷却中，第 n 次失败冷却 `min(max_retry_seconds, base_retry_seconds × 2^(n-1))` 秒（默认序列 5、10、20、40、80、160、300、300…）。冷却中的分片**单片与批量领取均跳过/拒绝**，`/ready` 单独列出 `cooling_chunks`；冷却结束后无需干预即可重新领取。令牌不匹配、租约已过期、分片已完成或会话已提交均返回 `409`。
 - **完成上报**：必须携带该分片**当前有效租约的令牌**与分片摘要；以相同令牌 + 相同摘要重复上报为幂等成功（返回 `idempotent_replay: true`），摘要不同则返回 `409`。完成后**清除退避冷却但保留 `failure_count`**。
+- **完成纠错回退（reopen）**：`POST /sessions/{id}/chunks/{index}/reopen` 凭目标分片**完成时保留的租约令牌**与 `expected_digest`（完成时上报的摘要）发起，仅允许**未提交会话中已完成且凭据匹配**的分片。校验通过后服务端沿依赖图找出**全部传递下游**，在**同一事务**内将目标及下游重置为 `pending`：清除摘要、完成时间、有效租约与退避截止时间，**保留累计失败次数**；同时会话 `revision` 递增 1。响应中的 `affected_chunks` 按**（拓扑层级, 分片序号）**升序稳定排列（目标层级为 0，层级取受影响子图中的最长路径）。任一校验失败（会话已提交 / 分片未完成 / 凭据不匹配）返回 `409` 且**不产生任何部分回退**；整个回退与并发领取互斥，领取方不会看到中间状态。
 - **会话级并发上限（可选）**：创建会话时可设置 `max_active_leases`，限制该会话**当前有效（未过期）租约**的总数。单片领取在槽位占满时返回 `409`；批量领取则原子地领取至多 `min(count, 剩余槽位, 可领取分片数)` 个租约。不设置（`null`）时保持原有不限并发的行为。
 - **批量领取**：`POST /sessions/{id}/leases/batch` 在**同一临界区**内完成资格计算与写入：仅从“未完成、无有效租约（过期租约视为空闲）、**不在退避冷却中**、前置已全部完成”的分片中，按分片序号升序领取，返回各分片独立令牌；并发请求之间不会重复分配、也不会突破并发上限。无可领取项时返回空列表及 `active` / `blocked` / `next_expiry` 汇总，其中 **`next_expiry` 取有效租约最早过期时间与各分片退避最早结束时间中的更早者**。
 - **提交**：仅当全部分片完成才允许提交，返回按分片序号升序汇总的清单；否则返回 `409` 及 `missing_chunks` 缺失分片列表。重复提交幂等返回同一清单。
@@ -54,11 +55,12 @@ docker compose up --build
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/sessions` | 创建上传会话（可选 `dependencies` 依赖图、`max_active_leases` 并发上限、`base_retry_seconds`/`max_retry_seconds` 退避参数） |
-| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数与当前 `active_leases`） |
+| `GET` | `/sessions/{session_id}` | 查询会话与逐分片状态（含各分片 `dependencies`、`failure_count`、`retry_after`、退避参数、当前 `active_leases` 与会话 `revision`） |
 | `GET` | `/sessions/{session_id}/ready` | 当前可领取的分片、被依赖阻塞的分片，以及退避冷却中的分片（`cooling_chunks`） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/lease` | 领取分片租约（同样受 `max_active_leases` 与退避冷却约束） |
 | `POST` | `/sessions/{session_id}/leases/batch` | 原子批量领取租约（按分片序号，数量不超过 `count` 与剩余并发槽位；自动跳过冷却分片） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/complete` | 上报分片完成（幂等；清除退避、保留失败次数） |
+| `POST` | `/sessions/{session_id}/chunks/{index}/reopen` | 完成纠错回退（凭完成时的令牌与摘要，原子重置目标及全部传递下游，`revision` 递增 1） |
 | `POST` | `/sessions/{session_id}/chunks/{index}/fail` | 上报分片失败（校验有效租约，原子清除租约并进入指数退避） |
 | `POST` | `/sessions/{session_id}/finalize` | 提交会话，返回按序分片清单 |
 | `GET` | `/healthz` | 健康检查 |
@@ -201,6 +203,45 @@ curl -s -X POST http://localhost:8000/sessions/$SID/chunks/0/complete \
   -H 'Content-Type: application/json' \
   -d "{\"lease_token\": \"<新租约令牌>\", \"chunk_digest\": \"<分片0的SHA256>\"}"
 # 状态查询中：status=completed, failure_count=1, retry_after=null
+```
+
+## 完成纠错回退（curl）
+
+已完成分片发现内容错误时，凭**完成时保留的租约令牌与摘要**调用 reopen，
+将目标分片连同依赖图中的全部传递下游原子重置为 `pending` 后重新上传：
+
+```bash
+# 1. 创建带依赖的会话：2 依赖 0、1；3 依赖 2
+SID=$(curl -s -X POST http://localhost:8000/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"total_chunks": 4, "file_digest": "<文件SHA256>",
+       "dependencies": {"2": [0, 1], "3": [2]}}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+
+# 2. 依次完成 0、1、2（略：领取租约 -> 上报完成），此时发现分片 1 的内容有误
+
+# 3. 凭分片 1 完成时保留的 lease_token 与摘要发起回退
+curl -s -X POST http://localhost:8000/sessions/$SID/chunks/1/reopen \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token": "<分片1完成时的租约令牌>", "expected_digest": "<分片1完成时上报的摘要>"}'
+# => {
+#      "session_id": "...", "chunk_index": 1, "revision": 1,
+#      "affected_chunks": [
+#        {"chunk_index": 1, "level": 0},
+#        {"chunk_index": 2, "level": 1},
+#        {"chunk_index": 3, "level": 2}
+#      ]
+#    }
+# 目标 1 与全部传递下游（2、3）在同一事务内被重置为 pending：
+# 摘要、完成时间、有效租约、退避截止时间全部清除，failure_count 保留；
+# 分片 0 不受影响。会话已提交、分片未完成或凭据不匹配时返回 409 且不做任何修改。
+
+# 4. 状态查询中的 revision 已递增（每次成功回退 +1），可据此判断发生过纠错
+curl -s http://localhost:8000/sessions/$SID
+# => {"revision": 1, "completed_chunks": 1, "missing_chunks": [1, 2, 3], ...}
+
+# 5. 按依赖顺序重新领取、重新完成受影响分片后即可正常提交
+curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 ```
 
 ## 本地开发（不用 Docker）

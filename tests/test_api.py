@@ -915,3 +915,287 @@ def test_migration_adds_failure_and_retry_columns_to_legacy_database(tmp_path):
 
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 完成纠错回退（reopen）
+
+def reopen(session_id, index, token, digest):
+    return client.post(
+        f"/sessions/{session_id}/chunks/{index}/reopen",
+        json={"lease_token": token, "expected_digest": digest},
+    )
+
+
+def lease_complete(session_id, index, digest=None):
+    """领取并立即完成分片；返回完成时保留的租约令牌与摘要。"""
+    token = lease(session_id, index).json()["lease_token"]
+    digest = digest if digest is not None else str(index) * 64
+    assert complete(session_id, index, token, digest).status_code == 200
+    return token, digest
+
+
+def test_reopen_resets_target_and_transitive_downstream_atomically():
+    # 依赖图：1←0 不相关；2→1；3→1；4→2；5 无依赖
+    s = make_session_with_deps(6, {2: [1], 3: [1], 4: [2]})
+
+    # 分片 0：先失败一次再完成（失败次数应跨完成/回退保留，且 0 不在回退范围内）
+    lease_fail_retry(s["id"], 0)
+    set_backoff(s["id"], 0, PAST)
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+
+    t1, d1 = lease_complete(s["id"], 1, "1" * 64)
+    lease_complete(s["id"], 2, "2" * 64)
+    t3 = lease(s["id"], 3).json()["lease_token"]      # 下游持有有效租约
+    lease_fail_retry(s["id"], 4)                       # 下游处于退避冷却中
+    # 分片 5 保持 pending，与回退无关
+
+    st0 = client.get(f"/sessions/{s['id']}").json()
+    assert st0["revision"] == 0
+
+    r = reopen(s["id"], 1, t1, d1)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["chunk_index"] == 1
+    assert body["revision"] == 1
+    # 目标 + 全部传递下游，按（拓扑层级, 分片序号）升序：1→0 层，2/3→1 层，4→2 层
+    assert body["affected_chunks"] == [
+        {"chunk_index": 1, "level": 0},
+        {"chunk_index": 2, "level": 1},
+        {"chunk_index": 3, "level": 1},
+        {"chunk_index": 4, "level": 2},
+    ]
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["revision"] == 1  # 成功回退递增一次
+    chunks = {c["chunk_index"]: c for c in st["chunks"]}
+
+    # 未被波及的分片保持原状
+    assert chunks[0]["status"] == "completed"
+    assert chunks[0]["chunk_digest"] == d0
+    assert chunks[0]["failure_count"] == 1
+    assert chunks[5]["status"] == "pending"
+
+    # 目标与下游：状态、摘要、完成时间、租约、退避全部清除
+    for idx in (1, 2, 3, 4):
+        c = chunks[idx]
+        assert c["status"] == "pending"
+        assert c["chunk_digest"] is None
+        assert c["completed_at"] is None
+        assert c["lease_expires_at"] is None
+        assert c["retry_after"] is None
+    # 累计失败次数保留
+    assert chunks[4]["failure_count"] == 1
+    assert chunks[1]["failure_count"] == 0
+
+    # 旧完成凭据全部失效：完成时保留的令牌、下游在途租约都不能再上报
+    assert complete(s["id"], 1, t1, d1).status_code == 409
+    assert complete(s["id"], 3, t3, "3" * 64).status_code == 409
+
+    # 回退后可按依赖顺序重新领取、重新完成并最终提交
+    assert lease(s["id"], 2).status_code == 409  # 前置 1 已回到 pending
+    _, nd1 = lease_complete(s["id"], 1, "a" * 64)
+    lease_complete(s["id"], 2, "b" * 64)
+    lease_complete(s["id"], 3, "c" * 64)
+    lease_complete(s["id"], 4, "d" * 64)
+    lease_complete(s["id"], 5, "e" * 64)
+    fin = client.post(f"/sessions/{s['id']}/finalize")
+    assert fin.status_code == 200
+    assert [m["chunk_digest"] for m in fin.json()["manifest"]] == [
+        d0, "a" * 64, "b" * 64, "c" * 64, "d" * 64, "e" * 64,
+    ]
+
+
+def test_reopen_topological_levels_with_diamond_and_skip_edges():
+    # 菱形 + 跨层边：5 直接依赖 0，但经 4 的路径更长，层级取最长路径
+    s = make_session_with_deps(7, {1: [0], 2: [0], 3: [1, 2], 4: [3], 5: [0, 4]})
+    tokens = {}
+    for i in range(6):  # 0..5 全部完成，6 保持 pending
+        tokens[i] = lease_complete(s["id"], i)
+
+    r = reopen(s["id"], 0, tokens[0][0], tokens[0][1])
+    assert r.status_code == 200, r.text
+    assert r.json()["affected_chunks"] == [
+        {"chunk_index": 0, "level": 0},
+        {"chunk_index": 1, "level": 1},
+        {"chunk_index": 2, "level": 1},
+        {"chunk_index": 3, "level": 2},
+        {"chunk_index": 4, "level": 3},
+        {"chunk_index": 5, "level": 4},  # 直接边 0→5 不压扁层级
+    ]
+    # 无依赖的 6 不受影响
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][6]["status"] == "pending"
+    assert st["revision"] == 1
+
+
+def test_reopen_requires_completed_chunk_and_matching_credentials():
+    s = make_session_with_deps(3, {1: [0], 2: [1]})
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    t1, d1 = lease_complete(s["id"], 1, "1" * 64)
+
+    # 目标分片未完成：pending / leased 均不可回退
+    assert reopen(s["id"], 2, "any", "any").status_code == 409
+    lease(s["id"], 2)
+    assert reopen(s["id"], 2, "any", "any").status_code == 409
+
+    # 令牌不匹配 / 摘要不匹配
+    assert reopen(s["id"], 1, "wrong-token", d1).status_code == 409
+    assert reopen(s["id"], 1, t1, "9" * 64).status_code == 409
+    # 凭据属于别的分片同样不匹配
+    assert reopen(s["id"], 1, t0, d0).status_code == 409
+
+    # 校验失败不得部分回退：状态与修订号保持原样
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["revision"] == 0
+    assert [c["status"] for c in st["chunks"]] == ["completed", "completed", "leased"]
+    assert st["chunks"][1]["chunk_digest"] == d1
+
+    # 未知会话 / 分片
+    assert reopen("nope", 0, "t", "d").status_code == 404
+    assert reopen(s["id"], 99, "t", "d").status_code == 404
+
+    # 缺字段 / 空串：请求校验
+    assert client.post(
+        f"/sessions/{s['id']}/chunks/1/reopen", json={"lease_token": t1}).status_code == 422
+    assert client.post(
+        f"/sessions/{s['id']}/chunks/1/reopen",
+        json={"lease_token": "", "expected_digest": d1}).status_code == 422
+
+
+def test_reopen_rejected_after_finalize():
+    s = make_session_with_deps(2, {1: [0]})
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    lease_complete(s["id"], 1, "1" * 64)
+    assert client.post(f"/sessions/{s['id']}/finalize").status_code == 200
+
+    assert reopen(s["id"], 0, t0, d0).status_code == 409
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["status"] == "finalized"
+    assert st["revision"] == 0
+    assert all(c["status"] == "completed" for c in st["chunks"])
+
+
+def test_revision_increments_once_per_successful_reopen():
+    s = make_session_with_deps(3, {1: [0], 2: [0]})
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    lease_complete(s["id"], 1, "1" * 64)
+    lease_complete(s["id"], 2, "2" * 64)
+
+    # 失败尝试不递增
+    assert reopen(s["id"], 0, "bad", d0).status_code == 409
+    assert client.get(f"/sessions/{s['id']}").json()["revision"] == 0
+
+    # 每次成功回退恰好递增 1
+    r1 = reopen(s["id"], 0, t0, d0)
+    assert r1.status_code == 200 and r1.json()["revision"] == 1
+    assert client.get(f"/sessions/{s['id']}").json()["revision"] == 1
+
+    t0b, d0b = lease_complete(s["id"], 0, "f" * 64)
+    r2 = reopen(s["id"], 0, t0b, d0b)
+    assert r2.status_code == 200 and r2.json()["revision"] == 2
+    assert client.get(f"/sessions/{s['id']}").json()["revision"] == 2
+
+
+def test_reopen_without_dependencies_only_resets_target():
+    s = make_session()
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    lease_complete(s["id"], 1, "1" * 64)
+
+    r = reopen(s["id"], 0, t0, d0)
+    assert r.status_code == 200
+    assert r.json()["affected_chunks"] == [{"chunk_index": 0, "level": 0}]
+
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert [c["status"] for c in st["chunks"]] == ["pending", "completed", "pending"]
+
+
+def test_reopen_and_concurrent_lease_never_observe_intermediate_state():
+    s = make_session_with_deps(2, {1: [0]})
+    t0, d0 = lease_complete(s["id"], 0, "0" * 64)
+    lease_complete(s["id"], 1, "1" * 64)
+
+    barrier = threading.Barrier(3)
+    lease_results: list[tuple[int, int]] = []  # (chunk_index, status_code)
+    results_lock = threading.Lock()
+
+    def do_reopen():
+        barrier.wait()
+        r = reopen(s["id"], 0, t0, d0)
+        assert r.status_code == 200
+
+    def do_lease(index):
+        barrier.wait()
+        r = lease(s["id"], index)
+        with results_lock:
+            lease_results.append((index, r.status_code))
+
+    threads = [
+        threading.Thread(target=do_reopen),
+        threading.Thread(target=do_lease, args=(0,)),
+        threading.Thread(target=do_lease, args=(1,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 领取要么在回退前（409 已完成）、要么在回退后（200 可领取），无中间态
+    assert {idx for idx, _ in lease_results} == {0, 1}
+    assert all(code in (200, 409) for _, code in lease_results)
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["revision"] == 1
+    for c in st["chunks"]:
+        if c["status"] == "leased":
+            # 只可能是回退后新领取的：无摘要、无完成时间
+            assert c["chunk_digest"] is None
+            assert c["completed_at"] is None
+        else:
+            assert c["status"] == "pending"
+            assert c["chunk_digest"] is None
+
+
+def test_migration_adds_revision_to_legacy_database(tmp_path):
+    import sqlite3
+
+    legacy = tmp_path / "legacy3.db"
+    conn = sqlite3.connect(legacy)
+    # 0003 之后、本次改动之前的旧 SCHEMA：sessions 无 revision 列
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+            file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+            status TEXT NOT NULL DEFAULT 'active', max_active_leases INTEGER,
+            base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+            max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+            created_at TEXT NOT NULL, finalized_at TEXT
+        );
+        CREATE TABLE chunks (
+            session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+            lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+            PRIMARY KEY (session_id, chunk_index)
+        );
+        INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm,
+                              status, created_at)
+            VALUES ('legacy-sid', 1, 'dig', 'sha256', 'active',
+                    '2026-01-01T00:00:00+00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    import app.db as db
+
+    migrated = sqlite3.connect(legacy)
+    db.run_migrations(migrated)
+    cols = {r[1] for r in migrated.execute("PRAGMA table_info(sessions)").fetchall()}
+    assert "revision" in cols
+    # 既有会话修订号从 0 开始
+    row = migrated.execute(
+        "SELECT revision FROM sessions WHERE id = 'legacy-sid'"
+    ).fetchone()
+    assert row[0] == 0
+    db.run_migrations(migrated)  # 再次执行幂等不报错
+    migrated.close()

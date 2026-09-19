@@ -8,8 +8,12 @@
 - 上报完成：需携带匹配租约令牌与分片摘要，重复上报幂等；完成后清除退避冷却、保留累计失败次数
 - 上报失败：需携带当前有效租约令牌，成功后原子清除租约并递增失败次数，
   第 n 次失败冷却 min(max, base×2^(n-1)) 秒，冷却期间单片/批量领取均跳过该分片
+- 完成纠错回退（reopen）：凭目标分片完成时保留的租约令牌与摘要发起，仅允许未提交会话中
+  已完成且凭据匹配的分片；同一事务内将目标及依赖图中的全部传递下游重置为 pending
+  （清除摘要、完成时间、有效租约与退避截止时间，保留累计失败次数），会话 revision 递增 1；
+  任一校验失败不产生部分回退，并发领取不会看到中间状态
 - 提交会话：仅当全部分片完成，返回按序分片清单，否则列出缺失分片
-- 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间）
+- 状态查询：会话与逐分片状态（含各分片依赖、失败次数与冷却截止时间，以及会话 revision）
 - 就绪查询：当前可领取的分片、被依赖阻塞的分片以及退避冷却中的分片
 """
 from __future__ import annotations
@@ -42,6 +46,9 @@ from .schemas import (
     LeaseResponse,
     ManifestEntry,
     ReadyResponse,
+    ReopenAffectedChunk,
+    ReopenRequest,
+    ReopenResponse,
     SessionResponse,
     SessionStatusResponse,
 )
@@ -138,6 +145,53 @@ def incomplete_dependencies(session_id: str, chunk_index: int) -> list[int]:
         (session_id, chunk_index),
     ).fetchall()
     return [row["depends_on"] for row in rows]
+
+
+def collect_reopen_affected(session_id: str, target: int) -> list[tuple[int, int]]:
+    """临界区内调用：沿依赖图找出目标分片的全部传递下游，返回
+    （分片序号, 拓扑层级）列表，按（层级, 序号）升序稳定排列。
+
+    受影响集合 = 目标分片 + 全部传递下游；目标层级为 0，其余节点取受影响
+    子图中的最长路径层级（Kahn 分层：节点仅在全部受影响前置处理完后进入
+    下一层），保证按（层级, 序号）排序后任意受影响前置都排在其下游之前。
+    依赖图在创建会话时已校验无环，分层必然收敛。
+    """
+    deps = load_dependencies(session_id)  # chunk_index -> 升序前置列表
+    children: dict[int, list[int]] = {}
+    for chunk_index, preds in deps.items():
+        for pred in preds:
+            children.setdefault(pred, []).append(chunk_index)
+
+    # 沿反向边（前置 -> 依赖它的分片）收集全部传递下游
+    affected = {target}
+    stack = [target]
+    while stack:
+        node = stack.pop()
+        for child in children.get(node, []):
+            if child not in affected:
+                affected.add(child)
+                stack.append(child)
+
+    # Kahn 分层：仅统计受影响子图内的入度，逐波推进得到最长路径层级
+    indegree = {
+        n: sum(1 for p in deps.get(n, []) if p in affected) for n in affected
+    }
+    level: dict[int, int] = {}
+    frontier = [n for n in affected if indegree[n] == 0]
+    current = 0
+    while frontier:
+        nxt: list[int] = []
+        for node in frontier:
+            level[node] = current
+            for child in children.get(node, []):
+                if child in affected:
+                    indegree[child] -= 1
+                    if indegree[child] == 0:
+                        nxt.append(child)
+        frontier = nxt
+        current += 1
+
+    return sorted(level.items(), key=lambda item: (item[1], item[0]))
 
 
 def count_active_leases(session_id: str, now: datetime) -> int:
@@ -298,6 +352,7 @@ def get_session_status(session_id: str):
         missing_chunks=missing,
         file_digest=session["file_digest"],
         digest_algorithm=session["digest_algorithm"],
+        revision=session["revision"],
         max_active_leases=session["max_active_leases"],
         base_retry_seconds=session["base_retry_seconds"],
         max_retry_seconds=session["max_retry_seconds"],
@@ -598,6 +653,60 @@ def fail_chunk(session_id: str, chunk_index: int, req: FailRequest):
         failure_count=failure_count,
         retry_after_seconds=delay,
         retry_after=retry_after,
+    )
+
+
+# ---------------------------------------------------------------- 完成纠错回退
+
+@app.post(
+    "/sessions/{session_id}/chunks/{chunk_index}/reopen",
+    response_model=ReopenResponse,
+    tags=["chunks"],
+    summary="纠错回退：将已完成分片及其全部传递下游原子重置为 pending",
+    responses={409: {"description": "会话已提交、分片未完成或完成凭据（令牌/摘要）不匹配"}},
+)
+def reopen_chunk(session_id: str, chunk_index: int, req: ReopenRequest):
+    """凭目标分片完成时保留的租约令牌与摘要发起回退：全部校验先于任何写入，
+    任一校验失败不产生部分回退；校验通过后在同一事务内将目标分片与依赖图中的
+    全部传递下游重置为 pending（清除摘要、完成时间、有效租约与退避截止时间，
+    保留累计失败次数），并将会话 revision 递增 1。资格计算与写入均在 DB_LOCK
+    临界区内，并发领取不会看到中间状态。"""
+    with DB_LOCK:
+        session = get_session_or_404(session_id)
+        chunk = get_chunk_or_404(session_id, chunk_index)
+
+        if session["status"] == "finalized":
+            raise HTTPException(status_code=409, detail="session already finalized")
+        if chunk["status"] != "completed":
+            raise HTTPException(status_code=409, detail="chunk is not completed")
+        if chunk["lease_token"] is None or chunk["lease_token"] != req.lease_token:
+            raise HTTPException(status_code=409, detail="lease token mismatch")
+        if chunk["chunk_digest"] != req.expected_digest:
+            raise HTTPException(status_code=409, detail="digest mismatch")
+
+        affected = collect_reopen_affected(session_id, chunk_index)
+        conn = get_conn()
+        # failure_count 不在重置之列：累计失败次数跨回退保留
+        conn.executemany(
+            "UPDATE chunks SET status = 'pending', lease_token = NULL,"
+            " lease_expires_at = NULL, chunk_digest = NULL, completed_at = NULL,"
+            " backoff_until = NULL"
+            " WHERE session_id = ? AND chunk_index = ?",
+            [(session_id, idx) for idx, _ in affected],
+        )
+        conn.execute(
+            "UPDATE sessions SET revision = revision + 1 WHERE id = ?",
+            (session_id,),
+        )
+        conn.commit()
+
+    return ReopenResponse(
+        session_id=session_id,
+        chunk_index=chunk_index,
+        revision=session["revision"] + 1,
+        affected_chunks=[
+            ReopenAffectedChunk(chunk_index=idx, level=lvl) for idx, lvl in affected
+        ],
     )
 
 

@@ -176,6 +176,31 @@ class FailResponse(BaseModel):
     retry_after: datetime = Field(description="冷却结束时间；在此之前该分片不可被领取")
 
 
+class ReopenRequest(BaseModel):
+    lease_token: str = Field(
+        min_length=1, max_length=128,
+        description="目标分片完成时所持有租约的令牌（完成上报后仍保留在分片记录中）")
+    expected_digest: str = Field(
+        min_length=1, max_length=256,
+        description="目标分片完成时上报的摘要；与记录不一致时拒绝回退")
+
+
+class ReopenAffectedChunk(BaseModel):
+    chunk_index: int
+    level: int = Field(
+        description="拓扑层级：被重开的目标分片为 0，其直接下游为 1，依此类推"
+                    "（取受影响子图中的最长路径层级）")
+
+
+class ReopenResponse(BaseModel):
+    session_id: str
+    chunk_index: int = Field(description="被纠错重开的目标分片")
+    revision: int = Field(description="本次回退后的会话修订号：每次成功 reopen 递增 1")
+    affected_chunks: list[ReopenAffectedChunk] = Field(
+        description="在同一事务内被重置为 pending 的全部分片：目标分片 + 依赖图中的全部传递下游，"
+                    "按（拓扑层级, 分片序号）升序稳定排列")
+
+
 class ManifestEntry(BaseModel):
     chunk_index: int
     chunk_digest: str
@@ -237,6 +262,8 @@ class SessionStatusResponse(BaseModel):
     missing_chunks: list[int]
     file_digest: str
     digest_algorithm: str
+    revision: int = Field(
+        default=0, description="会话修订号：每次成功 reopen 回退递增 1，创建时为 0")
     max_active_leases: Optional[int] = Field(
         default=None, description="会话级并发租约上限；null 表示不限并发")
     base_retry_seconds: int = Field(default=5, description="失败退避基数（秒）")
